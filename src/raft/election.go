@@ -38,7 +38,12 @@ func getElectionTimeoutRandomly() time.Duration {
 }
 
 func (rf *Raft) resetElectionTimer() {
-	rf.electionTimer.Stop()
+	if !rf.electionTimer.Stop() {
+		select {
+		case <-rf.electionTimer.C:
+		default:
+		}
+	}
 	rf.electionTimer.Reset(getElectionTimeoutRandomly())
 }
 
@@ -48,6 +53,8 @@ func (rf *Raft) resetElectionTimer() {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	defer rf.persist()
 
 	reply.VoteGranted = false
 
@@ -60,9 +67,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term == rf.currentTerm {
 		if rf.voteFor == -1 || rf.voteFor == args.CandidateId {
 			lastLogTerm, lastLogIdx := rf.getLastLogTermAndIdx()
-			if lastLogTerm <= args.LastLogTerm && lastLogIdx <= args.LastLogIdx {
-				rf.resetElectionTimer()
+			if lastLogTerm < args.LastLogTerm || lastLogTerm == args.LastLogTerm && lastLogIdx <= args.LastLogIdx {
 				reply.VoteGranted = true
+				rf.voteFor = args.CandidateId
 				return
 			} else {
 				reply.VoteGranted = false
@@ -76,15 +83,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if args.Term > rf.currentTerm {
 		//收到更大的term，先更新状态；再判断日志的新旧来投票
-		rf.currentTerm = args.Term
-		rf.role = FOLLOWER
+		rf.changeToFollower(args.Term)
+		//fixbug: 忘记在收到更大的term时更新votefor
 		rf.voteFor = -1
 
 		reply.Term = args.Term
 
 		lastLogTerm, lastLogIdx := rf.getLastLogTermAndIdx()
-		if lastLogTerm <= args.LastLogTerm && lastLogIdx <= args.LastLogIdx {
-			rf.resetElectionTimer()
+		if lastLogTerm < args.LastLogTerm || lastLogTerm == args.LastLogTerm && lastLogIdx <= args.LastLogIdx {
 			reply.VoteGranted = true
 			rf.voteFor = args.CandidateId
 			return
@@ -132,6 +138,8 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) electionHandle() {
 	rf.mu.Lock()
+	//fixbug: 即使是leader也需要重置自己的选举计时器
+	rf.resetElectionTimer()
 
 	//自己是leader，不用投票
 	if rf.role == LEADER {
@@ -139,10 +147,9 @@ func (rf *Raft) electionHandle() {
 		return
 	}
 
-	rf.role = CANDIDATE
-	rf.currentTerm++
-	rf.voteFor = rf.me
-	rf.resetElectionTimer()
+	rf.changeToCandidate()
+
+	rf.persist()
 
 	lastLogTerm, lastLogIndex := rf.getLastLogTermAndIdx()
 	request := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogTerm: lastLogTerm, LastLogIdx: lastLogIndex}
@@ -167,11 +174,9 @@ func (rf *Raft) electionHandle() {
 
 			rf.mu.Lock()
 			if response.Term > rf.currentTerm {
-				rf.mu.Lock()
-				rf.role = FOLLOWER
 				rf.voteFor = -1
-				rf.currentTerm = response.Term
-				rf.resetElectionTimer()
+				rf.changeToFollower(response.Term)
+				rf.persist()
 			}
 			rf.mu.Unlock()
 		}(peerIdx, &request)
@@ -195,15 +200,21 @@ func (rf *Raft) electionHandle() {
 		}
 		rf.mu.Lock()
 		if voteGrant > len(rf.peers)/2 && rf.role == CANDIDATE {
-			rf.role = LEADER
-			rf.leaderId = rf.me
+			rf.changeToLeader()
+			rf.resetElectionTimer()
+
+			rf.persist()
+
 			rf.mu.Unlock()
+			rf.heartBeatHandle()
 			return
 		} else if noGrant >= len(rf.peers)/2 && rf.role == CANDIDATE {
-			rf.role = FOLLOWER
+			rf.changeToFollower(rf.currentTerm)
+			rf.persist()
 			rf.mu.Unlock()
 			return
 		} else if rf.role != CANDIDATE {
+			rf.persist()
 			rf.mu.Unlock()
 			return
 		}

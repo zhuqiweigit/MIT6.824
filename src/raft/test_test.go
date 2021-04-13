@@ -157,6 +157,7 @@ func TestFailAgree2B(t *testing.T) {
 
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
+
 	cfg.disconnect((leader + 1) % servers)
 
 	// the leader and remaining follower should be
@@ -196,6 +197,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.disconnect((leader + 3) % servers)
 
 	index, _, ok := cfg.rafts[leader].Start(20)
+
 	if ok != true {
 		t.Fatalf("leader rejected Start()")
 	}
@@ -218,7 +220,9 @@ func TestFailNoAgree2B(t *testing.T) {
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
 	leader2 := cfg.checkOneLeader()
+
 	index2, _, ok2 := cfg.rafts[leader2].Start(30)
+
 	if ok2 == false {
 		t.Fatalf("leader2 rejected Start()")
 	}
@@ -361,7 +365,6 @@ func TestRejoin2B(t *testing.T) {
 	cfg.connect(leader1)
 
 	cfg.one(104, 2, true)
-
 	// all together now
 	cfg.connect(leader2)
 
@@ -381,6 +384,7 @@ func TestBackup2B(t *testing.T) {
 
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
+
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
@@ -407,6 +411,7 @@ func TestBackup2B(t *testing.T) {
 
 	// now another partitioned leader and one follower
 	leader2 := cfg.checkOneLeader()
+
 	other := (leader1 + 2) % servers
 	if leader2 == other {
 		other = (leader2 + 1) % servers
@@ -432,6 +437,10 @@ func TestBackup2B(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
+
+	//leaderdeb := cfg.checkOneLeader()
+
+	//fmt.Printf("\n\n\nleader3 %v ...........\n\n\n", leaderdeb)
 
 	// now everyone
 	for i := 0; i < servers; i++ {
