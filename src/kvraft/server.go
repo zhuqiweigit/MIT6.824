@@ -1,15 +1,19 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
+	"fmt"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
 const Debug = 0
+const RaftApplyTimeout = time.Millisecond * 2000
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -18,11 +22,17 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	ClientId    int64
+	OperationId int64
+	Key         string
+	Value       string
+	Method      string
+}
+
+type ApplyMsg struct {
+	Err   Err
+	Value string
 }
 
 type KVServer struct {
@@ -35,15 +45,156 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	//map[clientId]opId
+	recentApplyOpId map[int64]int64
+	//map[clientId+opId]chan
+	applyNotify map[string]chan ApplyMsg
+	stopCh      chan struct{}
+
+	dataBase map[string]string
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+
+	op := Op{ClientId: args.ClientId, OperationId: args.OperationId, Key: args.Key, Method: "Get"}
+
+	msg := kv.operationHandle(op)
+
+	reply.Err = msg.Err
+	reply.Value = msg.Value
+	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	op := Op{ClientId: args.ClientId, OperationId: args.OperationId, Key: args.Key, Value: args.Value, Method: args.Op}
+
+	msg := kv.operationHandle(op)
+
+	reply.Err = msg.Err
+
+	return
+}
+
+func (kv *KVServer) operationHandle(op Op) ApplyMsg {
+	kv.mu.Lock()
+
+	msg := ApplyMsg{}
+
+	if _, ok := kv.recentApplyOpId[op.ClientId]; ok == false {
+		kv.recentApplyOpId[op.ClientId] = -1
+	}
+
+	if op.OperationId < kv.recentApplyOpId[op.ClientId] {
+		msg.Err = ErrOldOperation
+		kv.mu.Unlock()
+		return msg
+	}
+
+	ch := make(chan ApplyMsg, 1)
+	clientOpPair := fmt.Sprintf("%v:%v", op.ClientId, op.OperationId)
+	kv.applyNotify[clientOpPair] = ch
+
+	kv.mu.Unlock()
+
+	_, _, isLeader := kv.rf.Start(op)
+
+	if isLeader == false {
+		msg.Err = ErrWrongLeader
+		kv.mu.Lock()
+		delete(kv.applyNotify, clientOpPair)
+		kv.mu.Unlock()
+		return msg
+	}
+
+	timer := time.NewTimer(RaftApplyTimeout)
+
+	select {
+	case <-timer.C:
+		{
+			msg.Err = ErrRaftTimeout
+			kv.mu.Lock()
+			delete(kv.applyNotify, clientOpPair)
+			kv.mu.Unlock()
+			return msg
+		}
+	case msg = <-ch:
+		{
+			return msg
+		}
+	}
+
+}
+
+func (kv *KVServer) applyToDatabaseLoop() {
+	for {
+		select {
+		case <-kv.stopCh:
+			{
+				return
+			}
+		case msg := <-kv.applyCh:
+			{
+				op := msg.Command.(Op)
+				//fmt.Printf("apply\n%+v\n", op)
+
+				result := ApplyMsg{}
+
+				kv.mu.Lock()
+
+				clientOpPair := fmt.Sprintf("%v:%v", op.ClientId, op.OperationId)
+				if _, ok := kv.recentApplyOpId[op.ClientId]; ok == false {
+					kv.recentApplyOpId[op.ClientId] = -1
+				}
+				if op.OperationId < kv.recentApplyOpId[op.ClientId] {
+					result.Err = ErrOldOperation
+				} else if op.OperationId == kv.recentApplyOpId[op.ClientId] {
+					if op.Method == "Get" {
+						val, ok := kv.dataBase[op.Key]
+						if ok == false {
+							result.Err = ErrNoKey
+							result.Value = ""
+						} else {
+							result.Err = OK
+							result.Value = val
+						}
+					} else {
+						result.Err = OK
+					}
+				} else if op.OperationId > kv.recentApplyOpId[op.ClientId] {
+					if op.Method == "Get" {
+						val, ok := kv.dataBase[op.Key]
+						if ok == false {
+							result.Err = ErrNoKey
+							result.Value = ""
+						} else {
+							result.Err = OK
+							result.Value = val
+						}
+					} else if op.Method == "Put" {
+						kv.dataBase[op.Key] = op.Value
+						result.Err = OK
+					} else if op.Method == "Append" {
+						val, ok := kv.dataBase[op.Key]
+						if ok == false {
+							kv.dataBase[op.Key] = op.Value
+						} else {
+							val = val + op.Value
+							kv.dataBase[op.Key] = val
+						}
+						result.Err = OK
+					}
+					kv.recentApplyOpId[op.ClientId] = op.OperationId
+				}
+
+				if ch, ok := kv.applyNotify[clientOpPair]; ok == true {
+					ch <- result
+					delete(kv.applyNotify, clientOpPair)
+				}
+				kv.mu.Unlock()
+			}
+		}
+	}
 }
 
 //
@@ -64,6 +215,9 @@ func (kv *KVServer) Kill() {
 
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
+	if z == 1 {
+		close(kv.stopCh)
+	}
 	return z == 1
 }
 
@@ -95,7 +249,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	kv.recentApplyOpId = make(map[int64]int64)
+	kv.applyNotify = make(map[string]chan ApplyMsg)
+	kv.dataBase = make(map[string]string)
+
+	kv.stopCh = make(chan struct{})
+
+	go kv.applyToDatabaseLoop()
 
 	return kv
 }
