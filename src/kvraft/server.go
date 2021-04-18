@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -13,7 +14,7 @@ import (
 )
 
 const Debug = 0
-const RaftApplyTimeout = time.Millisecond * 2000
+const RaftApplyTimeout = time.Millisecond * 1000
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -43,13 +44,15 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
 
-	// Your definitions here.
-	//map[clientId]opId
-	recentApplyOpId map[int64]int64
-	//map[clientId+opId]chan
-	applyNotify map[string]chan ApplyMsg
-	stopCh      chan struct{}
+	lastApplyIndex int
+	lastApplyTerm  int
+
+	recentApplyOpId map[int64]int64          //map[clientId]opId
+	applyNotify     map[string]chan ApplyMsg //map[clientId+opId]chan
+
+	stopCh chan struct{}
 
 	dataBase map[string]string
 }
@@ -108,6 +111,7 @@ func (kv *KVServer) operationHandle(op Op) ApplyMsg {
 	}
 
 	timer := time.NewTimer(RaftApplyTimeout)
+	defer timer.Stop()
 
 	select {
 	case <-timer.C:
@@ -126,6 +130,128 @@ func (kv *KVServer) operationHandle(op Op) ApplyMsg {
 
 }
 
+func (kv *KVServer) applyOperationToDataBase(msg raft.ApplyMsg, op Op) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	result := ApplyMsg{}
+
+	clientOpPair := fmt.Sprintf("%v:%v", op.ClientId, op.OperationId)
+
+	if _, ok := kv.recentApplyOpId[op.ClientId]; ok == false {
+		kv.recentApplyOpId[op.ClientId] = -1
+	}
+
+	if op.OperationId < kv.recentApplyOpId[op.ClientId] {
+		result.Err = ErrOldOperation
+	} else if op.OperationId == kv.recentApplyOpId[op.ClientId] {
+		kv.lastApplyIndex = msg.LogIndex
+		kv.lastApplyTerm = msg.LogTerm
+
+		if op.Method == "Get" {
+			val, ok := kv.dataBase[op.Key]
+			if ok == false {
+				result.Err = ErrNoKey
+				result.Value = ""
+			} else {
+				result.Err = OK
+				result.Value = val
+			}
+		} else {
+			result.Err = OK
+		}
+	} else if op.OperationId > kv.recentApplyOpId[op.ClientId] {
+		kv.lastApplyIndex = msg.LogIndex
+		kv.lastApplyTerm = msg.LogTerm
+
+		if op.Method == "Get" {
+			val, ok := kv.dataBase[op.Key]
+			if ok == false {
+				result.Err = ErrNoKey
+				result.Value = ""
+			} else {
+				result.Err = OK
+				result.Value = val
+			}
+		} else if op.Method == "Put" {
+			kv.dataBase[op.Key] = op.Value
+			result.Err = OK
+		} else if op.Method == "Append" {
+			val, ok := kv.dataBase[op.Key]
+			if ok == false {
+				kv.dataBase[op.Key] = op.Value
+			} else {
+				val = val + op.Value
+				kv.dataBase[op.Key] = val
+			}
+			result.Err = OK
+		}
+		kv.recentApplyOpId[op.ClientId] = op.OperationId
+	}
+
+	if ch, ok := kv.applyNotify[clientOpPair]; ok == true {
+		ch <- result
+		delete(kv.applyNotify, clientOpPair)
+	}
+
+}
+
+//已加锁，注意防止死锁
+func (kv *KVServer) checkIfNeedSnapshot() {
+
+	if kv.maxraftstate == -1 {
+		return
+	}
+	if kv.persister.RaftStateSize() >= kv.maxraftstate {
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+
+		kv.mu.Lock()
+		lastApplyIndex := kv.lastApplyIndex
+		lastApplyTerm := kv.lastApplyTerm
+
+		e.Encode(kv.lastApplyIndex)
+		e.Encode(kv.lastApplyTerm)
+		e.Encode(kv.dataBase)
+		e.Encode(kv.recentApplyOpId)
+		kv.mu.Unlock()
+
+		snapshotData := w.Bytes()
+
+		kv.rf.Snapshot(lastApplyIndex, lastApplyTerm, snapshotData)
+
+	} else {
+		return
+	}
+}
+
+func (kv *KVServer) recoverKVServerSnapshot(snapshotData []byte) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if snapshotData == nil || len(snapshotData) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshotData)
+	d := labgob.NewDecoder(r)
+
+	var lastApplyIndex int
+	var lastApplyTerm int
+	var dataBase map[string]string
+	var recentApplyOpId map[int64]int64
+
+	if d.Decode(&lastApplyIndex) != nil || d.Decode(&lastApplyTerm) != nil || d.Decode(&dataBase) != nil || d.Decode(&recentApplyOpId) != nil {
+		log.Fatal("decode snapshot error")
+	}
+
+	kv.lastApplyIndex = lastApplyIndex
+	kv.lastApplyTerm = lastApplyTerm
+	kv.dataBase = dataBase
+	kv.recentApplyOpId = recentApplyOpId
+
+}
+
 func (kv *KVServer) applyToDatabaseLoop() {
 	for {
 		select {
@@ -135,63 +261,19 @@ func (kv *KVServer) applyToDatabaseLoop() {
 			}
 		case msg := <-kv.applyCh:
 			{
-				op := msg.Command.(Op)
-				//fmt.Printf("apply\n%+v\n", op)
-
-				result := ApplyMsg{}
-
-				kv.mu.Lock()
-
-				clientOpPair := fmt.Sprintf("%v:%v", op.ClientId, op.OperationId)
-				if _, ok := kv.recentApplyOpId[op.ClientId]; ok == false {
-					kv.recentApplyOpId[op.ClientId] = -1
-				}
-				if op.OperationId < kv.recentApplyOpId[op.ClientId] {
-					result.Err = ErrOldOperation
-				} else if op.OperationId == kv.recentApplyOpId[op.ClientId] {
-					if op.Method == "Get" {
-						val, ok := kv.dataBase[op.Key]
-						if ok == false {
-							result.Err = ErrNoKey
-							result.Value = ""
-						} else {
-							result.Err = OK
-							result.Value = val
-						}
-					} else {
-						result.Err = OK
+				if msg.CommandValid == true {
+					op := msg.Command.(Op)
+					kv.applyOperationToDataBase(msg, op)
+				} else {
+					//install snapshot
+					snapshotData := msg.Command.([]byte)
+					needInstall := kv.rf.CondInstallSnapshot(msg.LogIndex, msg.LogTerm)
+					if needInstall == false {
+						break
 					}
-				} else if op.OperationId > kv.recentApplyOpId[op.ClientId] {
-					if op.Method == "Get" {
-						val, ok := kv.dataBase[op.Key]
-						if ok == false {
-							result.Err = ErrNoKey
-							result.Value = ""
-						} else {
-							result.Err = OK
-							result.Value = val
-						}
-					} else if op.Method == "Put" {
-						kv.dataBase[op.Key] = op.Value
-						result.Err = OK
-					} else if op.Method == "Append" {
-						val, ok := kv.dataBase[op.Key]
-						if ok == false {
-							kv.dataBase[op.Key] = op.Value
-						} else {
-							val = val + op.Value
-							kv.dataBase[op.Key] = val
-						}
-						result.Err = OK
-					}
-					kv.recentApplyOpId[op.ClientId] = op.OperationId
+					kv.recoverKVServerSnapshot(snapshotData)
 				}
-
-				if ch, ok := kv.applyNotify[clientOpPair]; ok == true {
-					ch <- result
-					delete(kv.applyNotify, clientOpPair)
-				}
-				kv.mu.Unlock()
+				kv.checkIfNeedSnapshot()
 			}
 		}
 	}
@@ -243,6 +325,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 
@@ -252,6 +335,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.recentApplyOpId = make(map[int64]int64)
 	kv.applyNotify = make(map[string]chan ApplyMsg)
 	kv.dataBase = make(map[string]string)
+
+	kv.recoverKVServerSnapshot(persister.ReadSnapshot())
 
 	kv.stopCh = make(chan struct{})
 
