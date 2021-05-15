@@ -40,6 +40,8 @@ type Clerk struct {
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	operationId int64
+	clientId    int64
 }
 
 //
@@ -56,6 +58,8 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.operationId = 0
+	ck.clientId = nrand()
 	return ck
 }
 
@@ -66,8 +70,8 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+	args := GetArgs{Key: key, ClientId: ck.clientId, OperationId: ck.operationId}
+	ck.operationId++
 
 	for {
 		shard := key2shard(key)
@@ -83,6 +87,12 @@ func (ck *Clerk) Get(key string) string {
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
+				}
+				if ok && (reply.Err == ErrWrongLeader) {
+					continue
+				}
+				if ok && (reply.Err == ErrRaftTimeout) {
+					continue
 				}
 				// ... not ok, or ErrWrongLeader
 			}
@@ -100,11 +110,8 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
-
+	args := PutAppendArgs{Key: key, Value: value, Op: op, ClientId: ck.clientId, OperationId: ck.operationId}
+	ck.operationId++
 
 	for {
 		shard := key2shard(key)
@@ -119,6 +126,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				}
 				if ok && reply.Err == ErrWrongGroup {
 					break
+				}
+				if ok && reply.Err == ErrWrongLeader {
+					continue
+				}
+				if ok && reply.Err == ErrRaftTimeout {
+					continue
 				}
 				// ... not ok, or ErrWrongLeader
 			}
