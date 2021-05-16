@@ -28,6 +28,19 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func DupConfig(config Config) Config {
+	newconfig := Config{}
+	newconfig.Num = config.Num
+	newconfig.Groups = make(map[int][]string)
+
+	copy(newconfig.Shards[:], config.Shards[:])
+	for gid, servers := range config.Groups {
+		newconfig.Groups[gid] = make([]string, len(servers))
+		copy(newconfig.Groups[gid], servers)
+	}
+	return newconfig
+}
+
 const (
 	OK               = "OK"
 	RaftApplyTimeout = "RaftApplyTimeOut"

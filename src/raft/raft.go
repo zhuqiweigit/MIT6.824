@@ -44,6 +44,8 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	LogIndex     int
+	LogTerm      int
 }
 
 type LogEntry struct {
@@ -61,8 +63,8 @@ const (
 )
 
 const (
-	HeartBeatTimeoutMs    = time.Millisecond * 35
-	ElectionTimeoutMsBase = time.Millisecond * 400
+	HeartBeatTimeoutMs    = time.Millisecond * 50
+	ElectionTimeoutMsBase = time.Millisecond * 500
 	ApplyTimeoutMs        = time.Millisecond * 50
 )
 
@@ -96,6 +98,9 @@ type Raft struct {
 	nextIndex          []int
 	matchIndex         []int
 
+	lastSnapshotIndex int
+	lastSnapshotTerm  int
+
 	electionTimer  *time.Timer
 	heartBeatTimer *time.Timer
 	applyTimer     *time.Timer
@@ -122,12 +127,12 @@ func (rf *Raft) changeToLeader() {
 	}
 }
 
-func (rf *Raft) printfLog(msg string) {
+func (rf *Raft) PrintfLog(msg string) {
 	//rf.mu.Lock()
 	//defer rf.mu.Unlock()
-	fmt.Printf("%v Id:%v\nterm:%v\nvoteFor:%v\nleaderId:%v\nrole:%v\nlastApplyIndex:%v\ncommitIndex:%v\nnext:%v\nmatch:%v\nlogLen:%v\n", msg,
-		rf.me, rf.currentTerm, rf.voteFor, rf.leaderId, rf.role, rf.lastApplyIndex, rf.commitIndex, rf.nextIndex, rf.matchIndex, len(rf.logEntries))
-	fmt.Printf("log: %v\n\n", rf.logEntries)
+	fmt.Printf("%v Id:%v\nterm:%v\nvoteFor:%v\nleaderId:%v\nrole:%v\nlastApplyIndex:%v\ncommitIndex:%v\nnext:%v\nmatch:%v\nlogLen:%v\nlastSnapshotIndex:%v\n", msg,
+		rf.me, rf.currentTerm, rf.voteFor, rf.leaderId, rf.role, rf.lastApplyIndex, rf.commitIndex, rf.nextIndex, rf.matchIndex, len(rf.logEntries), rf.lastSnapshotIndex)
+	//fmt.Printf("log: %v\n\n", rf.logEntries)
 }
 
 // return currentTerm and whether this server
@@ -150,22 +155,35 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.voteFor)
 	e.Encode(rf.logEntries)
+	e.Encode(rf.logEntryBeginIndex)
+	e.Encode(rf.lastSnapshotIndex)
+	e.Encode(rf.lastSnapshotTerm)
+
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
+}
+
+func (rf *Raft) getRaftStateData() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.logEntries)
+	e.Encode(rf.logEntryBeginIndex)
+	e.Encode(rf.lastSnapshotIndex)
+	e.Encode(rf.lastSnapshotTerm)
+
+	data := w.Bytes()
+
+	return data
 }
 
 //
@@ -175,32 +193,27 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var term int
+	var currentTerm int
 	var voteFor int
-	var logs []LogEntry
-	if d.Decode(&term) != nil || d.Decode(&voteFor) != nil || d.Decode(&logs) != nil {
+	var logEntryBeginIndex int
+	var lastSnapshotIndex int
+	var lastSnapshotTerm int
+	var logEntries []LogEntry
+
+	if d.Decode(&currentTerm) != nil || d.Decode(&voteFor) != nil || d.Decode(&logEntries) != nil || d.Decode(&logEntryBeginIndex) != nil ||
+		d.Decode(&lastSnapshotIndex) != nil || d.Decode(&lastSnapshotTerm) != nil {
 		log.Fatal("readPersist error")
-	} else {
-		rf.currentTerm = term
-		rf.voteFor = voteFor
-		rf.logEntries = logs
 	}
+	rf.currentTerm = currentTerm
+	rf.voteFor = voteFor
+	rf.logEntries = logEntries
+	rf.logEntryBeginIndex = logEntryBeginIndex
+	rf.lastSnapshotIndex = lastSnapshotIndex
+	rf.lastSnapshotTerm = lastSnapshotTerm
+
 }
 
 //
@@ -323,18 +336,36 @@ func (rf *Raft) resetApplyTimer() {
 
 func (rf *Raft) applyHandle() {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	rf.resetApplyTimer()
+
+	msgBuffer := make([]ApplyMsg, 0)
 
 	if rf.lastApplyIndex < rf.commitIndex {
 		for i := rf.lastApplyIndex + 1; i <= rf.commitIndex; i++ {
 			idx := i - rf.logEntryBeginIndex
-			applyMsg := ApplyMsg{CommandValid: true, CommandIndex: i, Command: rf.logEntries[idx].Command}
-			rf.applyCh <- applyMsg
+			//fmt.Printf("rf:%v i:%v  begin:%v  idx:%v  apply:%v  commit:%v\n", rf.me, i, rf.logEntryBeginIndex, idx, rf.lastApplyIndex, rf.commitIndex)
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				CommandIndex: i,
+				LogIndex:     rf.logEntries[idx].Index,
+				LogTerm:      rf.logEntries[idx].Term,
+				Command:      rf.logEntries[idx].Command}
+			msgBuffer = append(msgBuffer, applyMsg)
 		}
-		rf.lastApplyIndex = rf.commitIndex
+		//rf.lastApplyIndex = rf.commitIndex
 	}
+
+	rf.mu.Unlock()
+
+	//fixbug: channel不能加锁
+	for idx, _ := range msgBuffer {
+		rf.applyCh <- msgBuffer[idx]
+		rf.mu.Lock()
+		rf.lastApplyIndex++
+		rf.mu.Unlock()
+	}
+
 }
 
 //
@@ -376,13 +407,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	initLog := LogEntry{Index: 0, Term: 0}
 	rf.logEntries = append(rf.logEntries, initLog)
 	rf.logEntryBeginIndex = 0
-	rf.lastApplyIndex = 0
-	rf.commitIndex = 0
+
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
+	rf.lastSnapshotIndex = 0
+	rf.lastSnapshotTerm = 0
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.lastApplyIndex = rf.lastSnapshotIndex
 
 	rf.heartBeatTimer = time.NewTimer(HeartBeatTimeoutMs)
 	rf.electionTimer = time.NewTimer(getElectionTimeoutRandomly())

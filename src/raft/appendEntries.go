@@ -54,11 +54,20 @@ func (rf *Raft) AppendEntry(request *RequestAppendEntry, response *ResponseAppen
 		return
 	} else {
 		//不匹配
-		if rf.logEntries[prevLogIdx].Term != request.PrevLogTerm {
+		//fmt.Printf("id:%v begin:%v %+v\n", rf.me, rf.logEntryBeginIndex, request)
+		//rf.printfLog("")
+		if prevLogIdx >= 0 && rf.logEntries[prevLogIdx].Term != request.PrevLogTerm {
 			response.Success = false
 			response.Term = rf.currentTerm
 			return
 		}
+
+		if prevLogIdx < 0 {
+			trucLen := -1 * prevLogIdx
+			request.Entries = request.Entries[trucLen:]
+			prevLogIdx = 0
+		}
+
 		/**
 		fixBug1:
 			如果prevLogIdx处匹配成功了，代表prevLogIdx之前的全部匹配成功，但不代表之后的也匹配上了
@@ -128,8 +137,14 @@ func (rf *Raft) heartBeatHandle() {
 
 		go func(peerIdx int) {
 			rf.mu.Lock()
-			request := rf.makeAppendedEntries(peerIdx)
+			request, valid := rf.makeAppendedEntries(peerIdx)
 			rf.mu.Unlock()
+			//need send snapshot
+			if valid == false {
+				//fmt.Printf("send snapshot\n")
+				go rf.sendSnapshot(peerIdx)
+				return
+			}
 
 			response := ResponseAppendEntry{}
 			ok := rf.peers[peerIdx].Call("Raft.AppendEntry", &request, &response)
@@ -188,11 +203,16 @@ func (rf *Raft) tryToUpdateCommitIndex() {
 
 }
 
-func (rf *Raft) makeAppendedEntries(peerIndex int) RequestAppendEntry {
+func (rf *Raft) makeAppendedEntries(peerIndex int) (RequestAppendEntry, bool) {
 	next := rf.nextIndex[peerIndex]
 	arrayIdx := next - rf.logEntryBeginIndex
-	logs := append([]LogEntry{}, rf.logEntries[arrayIdx:]...)
 
+	if arrayIdx <= 0 {
+		return RequestAppendEntry{}, false
+	}
+
+	//fmt.Printf("%+v\narrayIdx%v\nnext%v\nbeginIdx%v\n", rf.logEntries, next, arrayIdx, rf.logEntryBeginIndex)
+	logs := append([]LogEntry{}, rf.logEntries[arrayIdx:]...)
 	request := RequestAppendEntry{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
@@ -204,5 +224,5 @@ func (rf *Raft) makeAppendedEntries(peerIndex int) RequestAppendEntry {
 		Entries: logs,
 	}
 
-	return request
+	return request, true
 }

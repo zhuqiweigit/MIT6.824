@@ -16,7 +16,7 @@ const (
 	Query = "Query"
 )
 const (
-	RaftTimeOutMs = time.Millisecond * 2000
+	RaftTimeOutMs = time.Millisecond * 1000
 )
 
 type NotifyMsg struct {
